@@ -1,22 +1,82 @@
 <# 
-.summary
-    Test that describes code.
-#>
+    .summary
+        Test that describes code.
 
+    .PARAMETER Force
+        Used to force any installations to occur without confirming with
+        the user.
+#>
 [CmdletBinding()]
-param()
+Param (
+    [Boolean]$Force = $false
+)
 
 if (!$PSScriptRoot) # $PSScriptRoot is not defined in 2.0
 {
     $PSScriptRoot = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
 }
+# Make sure MetaFixers.psm1 is loaded - it contains Get-TextFilesList
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'MetaFixers.psm1') -Force
+
+# Load the TestHelper module which contains the *-ResourceDesigner functions
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'TestHelper.psm1') -Force
 
 $ErrorActionPreference = 'stop'
 Set-StrictMode -Version latest
 
 $RepoRoot = (Resolve-Path $PSScriptRoot\..).Path
 
-Import-Module $PSScriptRoot\MetaFixers.psm1
+# Install and/or Import xDSCResourceDesigner Module
+if ($env:APPVEYOR) {
+    # Running in AppVeyor so force silent install of xDSCResourceDesigner
+    $PSBoundParameters.Force = $true
+}
+
+#TODO
+#$xDSCResourceDesignerModule = Install-ResourceDesigner @PSBoundParameters
+$xDSCResourceDesignerModuleName = "xDscResourceDesigner"
+$xDSCResourceDesignerModulePath = "$env:USERPROFILE\Documents\WindowsPowerShell\Modules\$xDSCResourceDesignerModuleName"
+$xDSCResourceDesignerModule = Install-ModuleFromPowerShellGallery -ModuleName $xDSCResourceDesignerModuleName -ModulePath $xDSCResourceDesignerModulePath @PSBoundParameters
+
+if ($xDSCResourceDesignerModule) {
+    # Import the module if it is available
+    $xDSCResourceDesignerModule | Import-Module -Force
+}
+else
+{
+    # Module could not/would not be installed - so warn user that tests will fail.
+    Write-Warning -Message ( @(
+        "The 'xDSCResourceDesigner' module is not installed. "
+        "The 'PowerShell DSC resource modules' Pester Tests in Meta.Tests.ps1 "
+        'will fail until this module is installed.'
+        ) -Join '' )
+}
+
+$PSScriptAnalyzerModuleName = "PSScriptAnalyzer"
+$PSScriptAnalyzerModulePath = "$env:USERPROFILE\Documents\WindowsPowerShell\Modules\$PSScriptAnalyzerModuleName"
+$PSScriptAnalyzerModule = Install-ModuleFromPowerShellGallery -ModuleName $PSScriptAnalyzerModuleName -ModulePath $PSScriptAnalyzerModulePath @PSBoundParameters
+
+if ($PSScriptAnalyzerModule) {
+    # Import the module if it is available
+    $PSScriptAnalyzerModule | Import-Module -Force
+}
+else
+{
+    # Module could not/would not be installed - so warn user that tests will fail.
+    Write-Warning -Message ( @(
+        "The 'PSScriptAnalyzer' module is not installed. "
+        "The 'PowerShell DSC resource modules' Pester Tests in Meta.Tests.ps1 "
+        'will fail until this module is installed.'
+        ) -Join '' )
+}
+
+# Modify PSModulePath of the current PowerShell session.
+# We want to make sure we always test the development version of the resource
+# in the current build directory.
+if (($env:PSModulePath.Split(';') | Select-Object -First 1) -ne $pwd)
+{
+    $env:PSModulePath = "$pwd;$env:PSModulePath"
+}
 
 Describe 'Text files formatting' {
     
@@ -38,11 +98,11 @@ Describe 'Text files formatting' {
 
     Context 'Indentations' {
 
-        It "Uses spaces for indentation, not tabs" {
+        It 'Uses spaces for indentation, not tabs' {
             $totalTabsCount = 0
             $allTextFiles | %{
                 $fileName = $_.FullName
-                $tabStrings = (cat $_.FullName -Raw) | Select-String "`t" | % {
+                $tabStrings = (Get-Content $_.FullName -Raw) | Select-String "`t" | % {
                     Write-Warning "There are tab in $fileName. Use Fixer 'Get-TextFilesList `$pwd | ConvertTo-SpaceIndentation'."
                     $totalTabsCount++
                 }
@@ -54,18 +114,43 @@ Describe 'Text files formatting' {
 
 Describe 'PowerShell DSC resource modules' {
     
+    Context 'PSScriptAnalyzer' 
+    {
+        It "passes Invoke-ScriptAnalyzer" 
+        {
+            $PSScriptAnalyzerErrors = Invoke-ScriptAnalyzer -path $RepoRoot -Severity Error -Recurse
+            if ($PSScriptAnalyzerErrors.Count -ne 0) 
+            {
+                Write-Error "There are PSScriptAnalyzer errors that need to be fixed:`n $PSScriptAnalyzerErrors"
+                Write-Error "For instructions on how to run PSScriptAnalyzer on your own machine, please go to https://github.com/powershell/psscriptAnalyzer/"
+                $PSScriptAnalyzerErrors.Count | Should Be 0
+            }
+        }      
+    }
+
     # Force convert to array
-    $psm1Files = @(ls $RepoRoot -Recurse -Filter "*.psm1" -File | ? {
-        # Ignore Composite configurations
-        # They requires additional resources to be installed on the box
-        ($_.FullName -like "*\DscResources\*") -and (-not ($_.Name -like "*.schema.psm1"))
-    })
+    $psm1Files = @(
+        Get-ChildItem -Path $RepoRoot\DscResources -Recurse -Filter '*.psm1' -File |
+            Foreach-Object {
+                # Ignore Composite configurations
+                # They requires additional resources to be installed on the box
+                if (-not ($_.Name -like '*.schema.psm1'))
+                {
+                    $MofFileName = "$($_.BaseName).schema.mof"
+                    $MofFilePath = Join-Path -Path $_.DirectoryName -ChildPath $MofFileName
+                    if (Test-Path -Path $MofFilePath -ErrorAction SilentlyContinue)
+                    {
+                        Write-Output -InputObject $_
+                    }
+                }
+            }
+    )
 
     if (-not $psm1Files) {
-        Write-Verbose -Verbose "There are no resource files to analyze"
+        Write-Verbose -Verbose 'There are no resource files to analyze'
     } else {
 
-        Write-Verbose -Verbose "Analyzing $($psm1Files.Count) files"
+        Write-Verbose -Verbose "Analyzing $($psm1Files.Count) resources"
 
         Context 'Correctness' {
 
@@ -85,17 +170,36 @@ Describe 'PowerShell DSC resource modules' {
 
             It 'all .psm1 files don''t have parse errors' {
                 $errors = @()
-                $psm1Files | %{ 
+                $psm1Files | ForEach-Object { 
                     $localErrors = Get-ParseErrors $_.FullName
                     if ($localErrors) {
                         Write-Warning "There are parsing errors in $($_.FullName)"
-                        Write-Warning ($localErrors | fl | Out-String)
+                        Write-Warning ($localErrors | Format-List | Out-String)
                     }
                     $errors += $localErrors
                 }
                 $errors.Count | Should Be 0
             }
         }
+
+        foreach ($psm1file in $psm1Files) 
+        {
+            Context "Schema Validation of $($psm1file.BaseName)" {
+
+                It 'should pass Test-xDscResource' {
+                    $result = Test-xDscResource -Name $psm1file.DirectoryName
+                    $result | Should Be $true
+                }
+
+                It 'should pass Test-xDscSchema' {
+                    $Splat = @{
+                        Path = $psm1file.DirectoryName
+                        ChildPath = "$($psm1file.BaseName).schema.mof"
+                    }
+                    $result = Test-xDscSchema -Path (Join-Path @Splat -Resolve -ErrorAction Stop)
+                    $result | Should Be $true
+                }
+            }
+        }
     }
 }
-
